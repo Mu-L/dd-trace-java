@@ -27,6 +27,7 @@ import javax.ws.rs.core.MediaType;
 import net.bytebuddy.asm.Advice;
 import org.glassfish.jersey.media.multipart.BodyPart;
 import org.glassfish.jersey.media.multipart.FormDataBodyPart;
+import org.glassfish.jersey.media.multipart.FormDataContentDisposition;
 import org.glassfish.jersey.media.multipart.MultiPart;
 import org.glassfish.jersey.message.internal.MediaTypes;
 
@@ -72,42 +73,78 @@ public class MultiPartReaderServerSideInstrumentation extends InstrumenterModule
       CallbackProvider cbp = AgentTracer.get().getCallbackProvider(RequestContextSlot.APPSEC);
       BiFunction<RequestContext, Object, Flow<Void>> callback =
           cbp.getCallback(EVENTS.requestBodyProcessed());
-      if (callback == null) {
+      BiFunction<RequestContext, List<String>, Flow<Void>> filenamesCallback =
+          cbp.getCallback(EVENTS.requestFilesFilenames());
+      if (callback == null && filenamesCallback == null) {
         return;
       }
 
-      Map<String, List<String>> map = new HashMap<>();
-      for (BodyPart bodyPart : ret.getBodyParts()) {
-        if (!(bodyPart instanceof FormDataBodyPart)) {
-          continue;
-        }
-        FormDataBodyPart dataBodyPart = (FormDataBodyPart) bodyPart;
-        if (!MediaTypes.typeEqual(MediaType.TEXT_PLAIN_TYPE, dataBodyPart.getMediaType())) {
-          continue;
-        }
-        // if the type of dataBodyPart.getEntity() is BodyPartEntity, it is safe to read the part
-        // more than once. So we're not depriving the application of the data by consuming it here
-        String v = dataBodyPart.getValue();
+      if (callback != null) {
+        Map<String, List<String>> map = new HashMap<>();
+        for (BodyPart bodyPart : ret.getBodyParts()) {
+          if (!(bodyPart instanceof FormDataBodyPart)) {
+            continue;
+          }
+          FormDataBodyPart dataBodyPart = (FormDataBodyPart) bodyPart;
+          if (!MediaTypes.typeEqual(MediaType.TEXT_PLAIN_TYPE, dataBodyPart.getMediaType())) {
+            continue;
+          }
+          // if the type of dataBodyPart.getEntity() is BodyPartEntity, it is safe to read the part
+          // more than once. So we're not depriving the application of the data by consuming it here
+          String v = dataBodyPart.getValue();
 
-        String name = dataBodyPart.getName();
-        List<String> values = map.get(name);
-        if (values == null) {
-          values = new ArrayList<>();
-          map.put(name, values);
+          String name = dataBodyPart.getName();
+          List<String> values = map.get(name);
+          if (values == null) {
+            values = new ArrayList<>();
+            map.put(name, values);
+          }
+
+          values.add(v);
         }
 
-        values.add(v);
+        Flow<Void> flow = callback.apply(reqCtx, map);
+        Flow.Action action = flow.getAction();
+        if (action instanceof Flow.Action.RequestBlockingAction) {
+          Flow.Action.RequestBlockingAction rba = (Flow.Action.RequestBlockingAction) action;
+          BlockResponseFunction blockResponseFunction = reqCtx.getBlockResponseFunction();
+          if (blockResponseFunction != null) {
+            blockResponseFunction.tryCommitBlockingResponse(reqCtx.getTraceSegment(), rba);
+            t = new BlockingException("Blocked request (for MultiPartReaderClientSide/readFrom)");
+            reqCtx.getTraceSegment().effectivelyBlocked();
+          }
+        }
       }
 
-      Flow<Void> flow = callback.apply(reqCtx, map);
-      Flow.Action action = flow.getAction();
-      if (action instanceof Flow.Action.RequestBlockingAction) {
-        Flow.Action.RequestBlockingAction rba = (Flow.Action.RequestBlockingAction) action;
-        BlockResponseFunction blockResponseFunction = reqCtx.getBlockResponseFunction();
-        if (blockResponseFunction != null) {
-          blockResponseFunction.tryCommitBlockingResponse(reqCtx.getTraceSegment(), rba);
-          t = new BlockingException("Blocked request (for MultiPartReaderClientSide/readFrom)");
-          reqCtx.getTraceSegment().effectivelyBlocked();
+      if (filenamesCallback != null) {
+        List<String> filenames = new ArrayList<>();
+        for (BodyPart bodyPart : ret.getBodyParts()) {
+          if (!(bodyPart instanceof FormDataBodyPart)) {
+            continue;
+          }
+          FormDataBodyPart dataBodyPart = (FormDataBodyPart) bodyPart;
+          FormDataContentDisposition cd = dataBodyPart.getFormDataContentDisposition();
+          if (cd == null) {
+            continue;
+          }
+          String filename = cd.getFileName();
+          if (filename != null && !filename.isEmpty()) {
+            filenames.add(filename);
+          }
+        }
+        if (!filenames.isEmpty()) {
+          Flow<Void> filenamesFlow = filenamesCallback.apply(reqCtx, filenames);
+          Flow.Action filenamesAction = filenamesFlow.getAction();
+          if (t == null && filenamesAction instanceof Flow.Action.RequestBlockingAction) {
+            Flow.Action.RequestBlockingAction rba =
+                (Flow.Action.RequestBlockingAction) filenamesAction;
+            BlockResponseFunction blockResponseFunction = reqCtx.getBlockResponseFunction();
+            if (blockResponseFunction != null) {
+              blockResponseFunction.tryCommitBlockingResponse(reqCtx.getTraceSegment(), rba);
+              t = new BlockingException("Blocked request (multipart file upload)");
+              reqCtx.getTraceSegment().effectivelyBlocked();
+            }
+          }
         }
       }
     }

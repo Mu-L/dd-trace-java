@@ -18,6 +18,7 @@ import datadog.trace.api.gateway.RequestContext;
 import datadog.trace.api.gateway.RequestContextSlot;
 import datadog.trace.bootstrap.instrumentation.api.AgentTracer;
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -72,28 +73,88 @@ public class MultipartFormDataReaderInstrumentation extends InstrumenterModule.A
       CallbackProvider cbp = AgentTracer.get().getCallbackProvider(RequestContextSlot.APPSEC);
       BiFunction<RequestContext, Object, Flow<Void>> callback =
           cbp.getCallback(EVENTS.requestBodyProcessed());
-      if (callback == null) {
+      BiFunction<RequestContext, List<String>, Flow<Void>> filenamesCallback =
+          cbp.getCallback(EVENTS.requestFilesFilenames());
+      if (callback == null && filenamesCallback == null) {
         return;
       }
 
-      Map<String, List<String>> m = new HashMap<>();
-      for (Map.Entry<String, List<InputPart>> e : ret.getFormDataMap().entrySet()) {
-        List<String> strings = new ArrayList<>();
-        m.put(e.getKey(), strings);
-        for (InputPart inputPart : e.getValue()) {
-          strings.add(inputPart.getBodyAsString());
+      if (callback != null) {
+        Map<String, List<String>> m = new HashMap<>();
+        for (Map.Entry<String, List<InputPart>> e : ret.getFormDataMap().entrySet()) {
+          List<String> strings = new ArrayList<>();
+          m.put(e.getKey(), strings);
+          for (InputPart inputPart : e.getValue()) {
+            strings.add(inputPart.getBodyAsString());
+          }
+        }
+
+        Flow<Void> flow = callback.apply(reqCtx, m);
+        Flow.Action action = flow.getAction();
+        if (action instanceof Flow.Action.RequestBlockingAction) {
+          Flow.Action.RequestBlockingAction rba = (Flow.Action.RequestBlockingAction) action;
+          BlockResponseFunction blockResponseFunction = reqCtx.getBlockResponseFunction();
+          if (blockResponseFunction != null) {
+            blockResponseFunction.tryCommitBlockingResponse(reqCtx.getTraceSegment(), rba);
+            t = new BlockingException("Blocked request (for MultipartFormDataInput/readFrom)");
+            reqCtx.getTraceSegment().effectivelyBlocked();
+          }
         }
       }
 
-      Flow<Void> flow = callback.apply(reqCtx, m);
-      Flow.Action action = flow.getAction();
-      if (action instanceof Flow.Action.RequestBlockingAction) {
-        Flow.Action.RequestBlockingAction rba = (Flow.Action.RequestBlockingAction) action;
-        BlockResponseFunction blockResponseFunction = reqCtx.getBlockResponseFunction();
-        if (blockResponseFunction != null) {
-          blockResponseFunction.tryCommitBlockingResponse(reqCtx.getTraceSegment(), rba);
-          t = new BlockingException("Blocked request (for MultipartFormDataInput/readFrom)");
-          reqCtx.getTraceSegment().effectivelyBlocked();
+      if (filenamesCallback != null) {
+        List<String> filenames = new ArrayList<>();
+        // Reflection avoids a bytecode ref to MultivaluedMap (javax→jakarta in RESTEasy 6)
+        Method getHeadersMethod = null;
+        try {
+          getHeadersMethod = InputPart.class.getMethod("getHeaders");
+        } catch (NoSuchMethodException ignored) {
+        }
+        if (getHeadersMethod != null) {
+          for (Map.Entry<String, List<InputPart>> e : ret.getFormDataMap().entrySet()) {
+            for (InputPart inputPart : e.getValue()) {
+              List<String> cdHeaders;
+              try {
+                @SuppressWarnings("unchecked")
+                Map<String, List<String>> headers =
+                    (Map<String, List<String>>) getHeadersMethod.invoke(inputPart);
+                cdHeaders = headers != null ? headers.get("Content-Disposition") : null;
+              } catch (Exception ignored) {
+                continue;
+              }
+              if (cdHeaders == null || cdHeaders.isEmpty()) {
+                continue;
+              }
+              String cd = cdHeaders.get(0);
+              for (String token : cd.split(";")) {
+                token = token.trim();
+                if (token.startsWith("filename=")) {
+                  String filename = token.substring(9).trim();
+                  if (filename.startsWith("\"") && filename.endsWith("\"")) {
+                    filename = filename.substring(1, filename.length() - 1);
+                  }
+                  if (!filename.isEmpty()) {
+                    filenames.add(filename);
+                  }
+                  break;
+                }
+              }
+            }
+          }
+        }
+        if (!filenames.isEmpty()) {
+          Flow<Void> filenamesFlow = filenamesCallback.apply(reqCtx, filenames);
+          Flow.Action filenamesAction = filenamesFlow.getAction();
+          if (t == null && filenamesAction instanceof Flow.Action.RequestBlockingAction) {
+            Flow.Action.RequestBlockingAction rba =
+                (Flow.Action.RequestBlockingAction) filenamesAction;
+            BlockResponseFunction blockResponseFunction = reqCtx.getBlockResponseFunction();
+            if (blockResponseFunction != null) {
+              blockResponseFunction.tryCommitBlockingResponse(reqCtx.getTraceSegment(), rba);
+              t = new BlockingException("Blocked request (multipart file upload)");
+              reqCtx.getTraceSegment().effectivelyBlocked();
+            }
+          }
         }
       }
     }
