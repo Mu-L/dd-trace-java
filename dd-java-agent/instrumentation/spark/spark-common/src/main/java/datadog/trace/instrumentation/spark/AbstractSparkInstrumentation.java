@@ -142,6 +142,19 @@ public abstract class AbstractSparkInstrumentation extends InstrumenterModule.Tr
   }
 
   public static class SparkSqlFailureAdvice {
+    @Advice.OnMethodEnter(suppress = Throwable.class)
+    public static void enter(@Advice.Argument(0) String sqlText) {
+      System.err.println(
+          "[DD-SPARK-DEBUG] SparkSqlFailureAdvice.enter: thread="
+              + Thread.currentThread().getName()
+              + ", sql="
+              + (sqlText != null && sqlText.length() > 200
+                  ? sqlText.substring(0, 200) + "..."
+                  : sqlText)
+              + ", listenerNull="
+              + (AbstractDatadogSparkListener.listener == null));
+    }
+
     @Advice.OnMethodExit(suppress = Throwable.class, onThrowable = Throwable.class)
     public static void exit(@Advice.Thrown Throwable throwable) {
       if (throwable != null) {
