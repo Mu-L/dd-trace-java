@@ -146,7 +146,10 @@ public class DatadogProfilingIntegration implements ProfilingContextIntegration 
 
   @Override
   public void onTaskDeactivation(ProfilerContext profilerContext, long startTicks) {
-    if (profilerContext == null) {
+    // Skip virtual-thread carrier threads: the "continue" carrier thread is a JVM internal
+    // detail. Emitting a synthetic SpanNode from it would place critical-path segments on a
+    // meaningless "continue" lane rather than on the virtual thread's logical work lane.
+    if (profilerContext == null || ThreadSupport.isVirtual()) {
       return;
     }
     long endNano = System.nanoTime();
