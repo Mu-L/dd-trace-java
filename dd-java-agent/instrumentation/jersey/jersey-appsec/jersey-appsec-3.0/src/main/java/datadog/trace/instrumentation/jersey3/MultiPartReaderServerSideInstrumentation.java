@@ -26,6 +26,7 @@ import java.util.Map;
 import java.util.function.BiFunction;
 import net.bytebuddy.asm.Advice;
 import org.glassfish.jersey.media.multipart.BodyPart;
+import org.glassfish.jersey.media.multipart.ContentDisposition;
 import org.glassfish.jersey.media.multipart.FormDataBodyPart;
 import org.glassfish.jersey.media.multipart.MultiPart;
 import org.glassfish.jersey.message.internal.MediaTypes;
@@ -70,18 +71,26 @@ public class MultiPartReaderServerSideInstrumentation extends InstrumenterModule
       }
 
       CallbackProvider cbp = AgentTracer.get().getCallbackProvider(RequestContextSlot.APPSEC);
-      BiFunction<RequestContext, Object, Flow<Void>> callback =
+      BiFunction<RequestContext, Object, Flow<Void>> bodyCallback =
           cbp.getCallback(EVENTS.requestBodyProcessed());
-      if (callback == null) {
+      BiFunction<RequestContext, List<String>, Flow<Void>> filenamesCb =
+          cbp.getCallback(EVENTS.requestFilesFilenames());
+      if (bodyCallback == null && filenamesCb == null) {
         return;
       }
 
       Map<String, List<String>> map = new HashMap<>();
+      List<String> filenames = new ArrayList<>();
       for (BodyPart bodyPart : ret.getBodyParts()) {
         if (!(bodyPart instanceof FormDataBodyPart)) {
           continue;
         }
         FormDataBodyPart dataBodyPart = (FormDataBodyPart) bodyPart;
+        ContentDisposition cd = dataBodyPart.getContentDisposition();
+        String filename = cd != null ? cd.getFileName() : null;
+        if (filename != null && !filename.isEmpty()) {
+          filenames.add(filename);
+        }
         if (!MediaTypes.typeEqual(MediaType.TEXT_PLAIN_TYPE, dataBodyPart.getMediaType())) {
           continue;
         }
@@ -99,14 +108,31 @@ public class MultiPartReaderServerSideInstrumentation extends InstrumenterModule
         values.add(v);
       }
 
-      Flow<Void> flow = callback.apply(reqCtx, map);
-      Flow.Action action = flow.getAction();
-      if (action instanceof Flow.Action.RequestBlockingAction) {
-        Flow.Action.RequestBlockingAction rba = (Flow.Action.RequestBlockingAction) action;
-        BlockResponseFunction blockResponseFunction = reqCtx.getBlockResponseFunction();
-        if (blockResponseFunction != null) {
-          blockResponseFunction.tryCommitBlockingResponse(reqCtx.getTraceSegment(), rba);
-          t = new BlockingException("Blocked request (for MultiPartReaderClientSide/readFrom)");
+      if (bodyCallback != null) {
+        Flow<Void> flow = bodyCallback.apply(reqCtx, map);
+        Flow.Action action = flow.getAction();
+        if (action instanceof Flow.Action.RequestBlockingAction) {
+          Flow.Action.RequestBlockingAction rba = (Flow.Action.RequestBlockingAction) action;
+          BlockResponseFunction blockResponseFunction = reqCtx.getBlockResponseFunction();
+          if (blockResponseFunction != null) {
+            blockResponseFunction.tryCommitBlockingResponse(reqCtx.getTraceSegment(), rba);
+            t = new BlockingException("Blocked request (for MultiPartReaderClientSide/readFrom)");
+            reqCtx.getTraceSegment().effectivelyBlocked();
+          }
+        }
+      }
+
+      if (filenamesCb != null && !filenames.isEmpty()) {
+        Flow<Void> filenamesFlow = filenamesCb.apply(reqCtx, filenames);
+        Flow.Action filenamesAction = filenamesFlow.getAction();
+        if (t == null && filenamesAction instanceof Flow.Action.RequestBlockingAction) {
+          Flow.Action.RequestBlockingAction rba =
+              (Flow.Action.RequestBlockingAction) filenamesAction;
+          BlockResponseFunction brf = reqCtx.getBlockResponseFunction();
+          if (brf != null) {
+            brf.tryCommitBlockingResponse(reqCtx.getTraceSegment(), rba);
+          }
+          t = new BlockingException("Blocked request (multipart file upload)");
           reqCtx.getTraceSegment().effectivelyBlocked();
         }
       }
