@@ -176,6 +176,22 @@ public class DatadogProfilingIntegration implements ProfilingContextIntegration 
         durationNanos,
         profilerContext.getEncodedOperationName(),
         profilerContext.getEncodedResourceName());
+    // Emit a SpanExecutionThread event so CausalDagExtractor can override the native
+    // profiler's OS-tid-based EVENT_THREAD attribution with the Java thread ID used by the
+    // JFR timeline.  Without this, the critical path segment for the synthetic span may land
+    // in a non-existent row (invisible) or a row whose thread-activity intervals don't match
+    // (arrow over blank space).  This mirrors what onSpanFinished() does for real spans.
+    // Skip for virtual threads: Thread.currentThread() returns the virtual thread object
+    // (whose JVM-assigned ID has no JFR timeline lane). For virtual threads the native
+    // profiler's EVENT_THREAD already resolves to the ForkJoin carrier via CPOOL and must
+    // not be overridden.
+    if (!ThreadSupport.isVirtual()) {
+      SpanExecutionThreadEvent syntheticThreadEvent = new SpanExecutionThreadEvent();
+      syntheticThreadEvent.spanId = syntheticSpanId;
+      syntheticThreadEvent.executionThreadId = Thread.currentThread().getId();
+      syntheticThreadEvent.executionThreadName = Thread.currentThread().getName();
+      syntheticThreadEvent.commit();
+    }
   }
 
   public void clearContext() {
