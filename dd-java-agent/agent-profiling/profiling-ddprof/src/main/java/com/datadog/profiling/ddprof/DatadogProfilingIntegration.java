@@ -145,15 +145,11 @@ public class DatadogProfilingIntegration implements ProfilingContextIntegration 
   }
 
   @Override
-  public void onTaskDeactivation(ProfilerContext profilerContext, long startTicks) {
-    // Skip virtual-thread carrier threads: the "continue" carrier thread is a JVM internal
-    // detail. Emitting a synthetic SpanNode from it would place critical-path segments on a
-    // meaningless "continue" lane rather than on the virtual thread's logical work lane.
-    if (profilerContext == null || ThreadSupport.isVirtual()) {
+  public void onTaskDeactivation(ProfilerContext profilerContext, long startNano) {
+    if (profilerContext == null) {
       return;
     }
     long endNano = System.nanoTime();
-    long startNano = startTicks; // startTicks carries nanoTime at activation (see TPEHelper)
     long durationNanos = endNano - startNano;
     if (durationNanos <= 0) {
       return;
@@ -163,6 +159,13 @@ public class DatadogProfilingIntegration implements ProfilingContextIntegration 
     // JVM lifetime. Residual error is bounded by the 1 ms resolution of currentTimeMillis().
     long epochOffset = System.currentTimeMillis() * 1_000_000L - endNano;
     long startNanos = startNano + epochOffset;
+    // Thread.currentThread().getId() returns the virtual thread's JVM-assigned ID when called
+    // inside a virtual thread — that is intentional: it contributes uniqueness to the synthetic
+    // span ID without affecting thread attribution.  The native profiler captures the OS thread
+    // ID (ProfiledThread::currentTid()) for EVENT_THREAD, which is always the ForkJoin carrier
+    // thread that is physically executing the virtual thread at this point.  The resulting
+    // SpanNode is therefore attributed to the carrier in JFR, making it visible in the critical
+    // path as a ForkJoin worker rather than disappearing into the unattributed lane.
     long syntheticSpanId =
         profilerContext.getSpanId() ^ ((long) Thread.currentThread().getId() << 32) ^ startNano;
     DDPROF.recordSpanNodeEvent(
